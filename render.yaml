@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: unified-anime-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /ready
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: API_VERSION
+        value: 2.1.1
+      - key: CORS_ORIGIN
+        value: "*"
+      - key: RATE_LIMIT
+        value: "120"
+      - key: RATE_WINDOW_MS
+        value: "60000"
+      - key: STARTUP_TIMEOUT_MS
+        value: "60000"
+      - key: UPSTREAM_TIMEOUT_MS
+        value: "30000"
+      - key: TRUST_PROXY
+        value: "true"

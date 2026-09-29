@@ -1,0 +1,19 @@
+{
+  "name": "unified-anime-api",
+  "version": "2.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node gateway/server.mjs",
+    "build": "npm --prefix anime-sdk install --include=dev --no-audit --no-fund && npm --prefix anime-sdk run build",
+    "check": "node --check gateway/server.mjs",
+    "test": "npm --prefix anime-sdk run test:run"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "wreq-js": "^3.2.0"
+  }
+}

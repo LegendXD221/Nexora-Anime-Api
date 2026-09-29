@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.astro/
+references/
+.DS_Store
+*.log
+scratch

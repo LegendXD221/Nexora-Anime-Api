@@ -1,0 +1,17 @@
+.git
+.gitignore
+node_modules
+**/node_modules
+**/dist
+**/.cache
+**/.pytest_cache
+**/__pycache__
+*.pyc
+*.log
+.env
+.env.*
+!/.env.example
+coverage
+.vscode
+.idea
+.DS_Store

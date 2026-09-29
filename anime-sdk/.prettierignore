@@ -1,0 +1,8 @@
+dist/
+node_modules/
+website/dist/
+website/node_modules/
+website/.astro/
+scratch/
+pnpm-lock.yaml
+package-lock.json

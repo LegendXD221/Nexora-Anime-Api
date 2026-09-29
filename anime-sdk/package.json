@@ -1,0 +1,60 @@
+{
+  "name": "anime-sdk",
+  "version": "1.1.0",
+  "description": "Universal Media Scraper SDK",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "license": "MIT",
+  "author": "hexxt-git",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hexxt-git/anime-sdk.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hexxt-git/anime-sdk/issues"
+  },
+  "homepage": "https://github.com/hexxt-git/anime-sdk#readme",
+  "keywords": [
+    "anime",
+    "sdk",
+    "scraper",
+    "api"
+  ],
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "scripts": {
+    "build": "tsup",
+    "release": "changeset publish",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "prepare": "husky || true"
+  },
+  "dependencies": {
+    "linkedom": "^0.18.12"
+  },
+  "lint-staged": {
+    "*.{ts,tsx,js,mjs,astro,css,json,md,mdx}": "prettier --write"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.31.0",
+    "@types/node": "^25.9.1",
+    "husky": "^9.1.7",
+    "lint-staged": "^15.2.10",
+    "prettier": "^3.8.3",
+    "prettier-plugin-astro": "^0.14.1",
+    "prettier-plugin-tailwindcss": "^0.8.0",
+    "tsup": "^8.5.1",
+    "typescript": "^5.4.5",
+    "vitest": "^4.1.8"
+  }
+}
