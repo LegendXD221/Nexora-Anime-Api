@@ -24,3 +24,15 @@ services:
         value: "30000"
       - key: TRUST_PROXY
         value: "true"
+      - key: DISCOVERY_TIMEOUT_MS
+        value: "10000"
+      - key: EXTRACTION_TIMEOUT_MS
+        value: "25000"
+      - key: STREAM_VALIDATION_TIMEOUT_MS
+        value: "7000"
+      - key: HLS_VALIDATION_TIMEOUT_MS
+        value: "5000"
+      - key: TOTAL_REQUEST_DEADLINE_MS
+        value: "60000"
+      - key: MAX_VALIDATION_CANDIDATES
+        value: "6"

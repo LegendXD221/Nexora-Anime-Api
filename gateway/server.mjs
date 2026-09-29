@@ -21,6 +21,12 @@ const ANIVEXA_PORT = Number(process.env.ANIVEXA_PORT || 4001);
 const SDK_PORT = Number(process.env.SDK_PORT || 3001);
 const KUHI_PORT = Number(process.env.KUHI_PORT || 8001);
 const STARTUP_TIMEOUT_MS = Number(process.env.STARTUP_TIMEOUT_MS || 30000);
+const DISCOVERY_TIMEOUT_MS = Number(process.env.DISCOVERY_TIMEOUT_MS || 10000);
+const EXTRACTION_TIMEOUT_MS = Number(process.env.EXTRACTION_TIMEOUT_MS || 25000);
+const STREAM_VALIDATION_TIMEOUT_MS = Number(process.env.STREAM_VALIDATION_TIMEOUT_MS || 7000);
+const HLS_VALIDATION_TIMEOUT_MS = Number(process.env.HLS_VALIDATION_TIMEOUT_MS || 5000);
+const TOTAL_REQUEST_DEADLINE_MS = Number(process.env.TOTAL_REQUEST_DEADLINE_MS || 60000);
+const MAX_VALIDATION_CANDIDATES = Number(process.env.MAX_VALIDATION_CANDIDATES || 6);
 const RATE_LIMIT = Number(process.env.RATE_LIMIT || 120);
 const RATE_WINDOW_MS = Number(process.env.RATE_WINDOW_MS || 60_000);
 const TRUST_PROXY = process.env.TRUST_PROXY === 'true';
@@ -96,7 +102,7 @@ async function startAnivexa() {
       for (const [key, value] of response.headers) res.setHeader(key, value);
       res.end(Buffer.from(await response.arrayBuffer()));
     } catch (error) {
-      json(res, 500, { error: 'Anivexa upstream error', detail: error?.message || String(error) });
+      json(res, 500, { error: 'Anivexa upstream error', detail: safeError(error) });
     }
   });
   await new Promise((resolve, reject) => {
@@ -187,90 +193,138 @@ async function waitForKuhi() {
 
 
 
-async function fetchJson(url, options = {}) {
-  const response = await fetch(url, {
-    ...options,
-    signal: options.signal || AbortSignal.timeout(Number(process.env.UPSTREAM_TIMEOUT_MS || 30000)),
-  });
-  const text = await response.text();
-  let data;
-  try { data = text ? JSON.parse(text) : null; } catch { data = null; }
-  if (!response.ok) {
-    const message = data?.error || data?.detail || `HTTP ${response.status}`;
-    throw new Error(message);
-  }
-  return data;
-}
-
-function normalizeStreams(payload, provider, engine, episode, audio) {
-  if (!payload) return [];
-  if (Array.isArray(payload.streams)) {
-    return payload.streams.map((s) => ({
-      url: s.url || s.sourceUrl || s.file || s.src,
-      type: s.type || (s.isHLS ? 'hls' : 'mp4'),
-      quality: s.quality || 'auto',
-      language: s.audio || s.language || audio,
-      headers: s.headers || (s.referer ? { Referer: s.referer } : undefined),
-      subtitles: s.subtitles || [],
-      server: s.server || provider,
-    })).filter((s) => typeof s.url === 'string' && /^https?:\/\//i.test(s.url));
-  }
-  if (payload.type === 'video' && Array.isArray(payload.streams)) return normalizeStreams(payload, provider, engine, episode, audio);
-  return [];
-}
-
-async function validateStream(stream, timeoutMs = 7000) {
-  if (!stream?.url) return false;
-  try {
-    const response = await fetch(stream.url, {
-      method: 'GET',
-      headers: stream.headers || {},
-      redirect: 'follow',
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!response.ok) return false;
-    const contentType = (response.headers.get('content-type') || '').toLowerCase();
-    const url = stream.url.toLowerCase();
-    if (stream.type === 'hls' || stream.type === 'm3u8' || url.includes('.m3u8')) {
-      const body = await response.text();
-      return body.includes('#EXTM3U');
-    }
-    return contentType.startsWith('video/') || contentType.includes('mpegurl') || contentType.includes('octet-stream') || url.includes('.mp4') || url.includes('.mkv');
-  } catch {
-    return false;
+class TimeoutError extends Error {
+  constructor(stage) {
+    super(`${stage} timeout`);
+    this.name = 'TimeoutError';
+    this.stage = stage;
   }
 }
 
-async function validateAndReturn(streams, provider, engine, episode, audio, attempts) {
-  if (!streams.length) throw new Error('No streams returned');
-  const ordered = [...streams].sort((a, b) => {
-    const q = (v) => Number(String(v.quality || '').replace(/[^0-9]/g, '')) || 0;
-    return q(b) - q(a);
-  });
-  const checks = await Promise.all(ordered.map(async (stream) => ({ stream, ok: await validateStream(stream) })));
-  const working = checks.find((x) => x.ok)?.stream;
-  if (!working) throw new Error('Returned streams failed validation');
+function safeError(error) {
+  if (error instanceof TimeoutError) return error.message;
+  const message = error?.message || String(error || 'provider error');
+  if (/abort|timeout/i.test(message)) return 'provider timeout';
+  if (/HTTP \d{3}/i.test(message)) return message.match(/HTTP \d{3}/i)[0];
+  return message.replace(/https?:\/\/\S+/gi, '[upstream]').slice(0, 160);
+}
+
+function stageTimeout(stage, timeoutMs, parentSignal) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new TimeoutError(stage)), timeoutMs);
+  const abortParent = () => controller.abort(parentSignal.reason || new Error('request aborted'));
+  if (parentSignal) {
+    if (parentSignal.aborted) abortParent();
+    else parentSignal.addEventListener('abort', abortParent, { once: true });
+  }
   return {
-    ok: true,
-    provider,
-    engine,
-    episode: Number(episode),
-    audio,
-    stream: working,
-    streams: ordered,
-    attempts,
+    signal: controller.signal,
+    cleanup: () => {
+      clearTimeout(timer);
+      parentSignal?.removeEventListener('abort', abortParent);
+    },
   };
 }
 
-async function tryKuhi(anilistId, episode, audio, attempts) {
-  const data = await fetchJson(`http://127.0.0.1:${KUHI_PORT}/anime/extract/${encodeURIComponent(anilistId)}?e=${encodeURIComponent(episode)}&type=${encodeURIComponent(audio)}`);
-  const streams = normalizeStreams(data, data?.provider || 'kuhi', 'kuhi', episode, audio);
-  attempts.push({ engine: 'kuhi', provider: data?.provider || null, streams: streams.length });
-  return validateAndReturn(streams, data?.provider || 'kuhi', 'kuhi', episode, audio, attempts);
+async function fetchJson(url, { timeoutMs = EXTRACTION_TIMEOUT_MS, stage = 'provider', signal, headers, ...options } = {}) {
+  const timed = stageTimeout(stage, timeoutMs, signal);
+  try {
+    const response = await fetch(url, { ...options, headers, signal: timed.signal });
+    const text = await response.text();
+    let data;
+    try { data = text ? JSON.parse(text) : null; } catch { data = null; }
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return data;
+  } catch (error) {
+    if (timed.signal.aborted) {
+      if (timed.signal.reason instanceof TimeoutError) throw timed.signal.reason;
+      throw new Error('request aborted');
+    }
+    throw error;
+  } finally {
+    timed.cleanup();
+  }
 }
 
-async function tryAnivexa(anilistId, episode, audio, attempts) {
-  const data = await fetchJson(`http://127.0.0.1:${ANIVEXA_PORT}/episodes/${encodeURIComponent(anilistId)}`);
+function streamKey(stream) {
+  return `${String(stream.url).replace(/[?#].*$/, '').toLowerCase()}|${String(stream.server || '').toLowerCase()}`;
+}
+
+function normalizeStreams(payload, provider, engine, episode, audio) {
+  if (!payload || !Array.isArray(payload.streams)) return [];
+  const seen = new Set();
+  const result = [];
+  for (const s of payload.streams) {
+    const url = s?.url || s?.sourceUrl || s?.file || s?.src;
+    if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) continue;
+    const stream = {
+      url,
+      type: s.type || (s.isHLS || /\.m3u8(?:$|\?)/i.test(url) ? 'hls' : 'mp4'),
+      quality: s.quality || 'auto',
+      language: s.audio || s.language || audio,
+      headers: s.headers || (s.referer ? { Referer: s.referer } : undefined),
+      subtitles: Array.isArray(s.subtitles) ? s.subtitles : [],
+      server: s.server || provider,
+    };
+    const key = streamKey(stream);
+    if (!seen.has(key)) { seen.add(key); result.push(stream); }
+  }
+  return result;
+}
+
+function orderStreams(streams) {
+  return [...streams].sort((a, b) => {
+    const typeRank = (s) => s.type === 'embed' ? 0 : s.type === 'hls' || /\.m3u8/i.test(s.url) ? 3 : 2;
+    const q = (v) => Number(String(v.quality || '').replace(/[^0-9]/g, '')) || 0;
+    return typeRank(b) - typeRank(a) || q(b) - q(a);
+  });
+}
+
+async function validateStream(stream, signal) {
+  if (!stream?.url) return false;
+  const isHls = stream.type === 'hls' || stream.type === 'm3u8' || /\.m3u8(?:$|\?)/i.test(stream.url);
+  const timed = stageTimeout(isHls ? 'HLS validation' : 'stream validation', isHls ? HLS_VALIDATION_TIMEOUT_MS : STREAM_VALIDATION_TIMEOUT_MS, signal);
+  try {
+    const response = await fetch(stream.url, {
+      method: isHls ? 'GET' : 'GET',
+      headers: { ...(stream.headers || {}), ...(isHls ? {} : { Range: 'bytes=0-1' }) },
+      redirect: 'follow',
+      signal: timed.signal,
+    });
+    if (!response.ok) return false;
+    const contentType = (response.headers.get('content-type') || '').toLowerCase();
+    if (isHls) return (await response.text()).includes('#EXTM3U');
+    return contentType.startsWith('video/') || contentType.includes('mpegurl') || contentType.includes('octet-stream') || /\.(mp4|mkv)(?:$|\?)/i.test(stream.url);
+  } catch {
+    return false;
+  } finally {
+    timed.cleanup();
+  }
+}
+
+async function validateAndReturn(streams, provider, engine, episode, audio, attempts, signal) {
+  const ordered = orderStreams(streams);
+  if (!ordered.length) throw new Error('No streams returned');
+  const candidates = ordered.slice(0, Math.max(1, MAX_VALIDATION_CANDIDATES));
+  for (const stream of candidates) {
+    if (signal?.aborted) throw signal.reason || new Error('request deadline exceeded');
+    if (await validateStream(stream, signal)) {
+      return { ok: true, provider, engine, episode: Number(episode), audio, stream, streams: ordered, attempts };
+    }
+  }
+  throw new Error('Returned streams failed validation');
+}
+
+async function tryKuhi(anilistId, episode, audio, attempts, ctx) {
+  const data = await fetchJson(`http://127.0.0.1:${KUHI_PORT}/anime/extract/${encodeURIComponent(anilistId)}?e=${encodeURIComponent(episode)}&type=${encodeURIComponent(audio)}`, { timeoutMs: EXTRACTION_TIMEOUT_MS, stage: 'Kuhi extraction', signal: ctx.signal });
+  const provider = data?.provider || 'kuhi';
+  const streams = normalizeStreams(data, provider, 'kuhi', episode, audio);
+  attempts.push({ engine: 'kuhi', provider, streams: streams.length });
+  return validateAndReturn(streams, provider, 'kuhi', episode, audio, attempts, ctx.signal);
+}
+
+async function tryAnivexa(anilistId, episode, audio, attempts, ctx) {
+  const data = await fetchJson(`http://127.0.0.1:${ANIVEXA_PORT}/episodes/${encodeURIComponent(anilistId)}`, { timeoutMs: DISCOVERY_TIMEOUT_MS, stage: 'Anivexa discovery', signal: ctx.signal });
   const candidates = [];
   for (const [provider, entry] of Object.entries(data || {})) {
     const lists = entry?.episodes?.[audio] || [];
@@ -280,44 +334,37 @@ async function tryAnivexa(anilistId, episode, audio, attempts) {
   for (const candidate of candidates) {
     try {
       const path = candidate.id.startsWith('/') ? candidate.id : `/${candidate.id}`;
-      const result = await fetchJson(`http://127.0.0.1:${ANIVEXA_PORT}${path}`);
+      const result = await fetchJson(`http://127.0.0.1:${ANIVEXA_PORT}${path}`, { timeoutMs: EXTRACTION_TIMEOUT_MS, stage: 'Anivexa extraction', signal: ctx.signal });
       const streams = normalizeStreams(result, candidate.provider, 'anivexa', episode, audio);
       attempts.push({ engine: 'anivexa', provider: candidate.provider, streams: streams.length });
-      try { return await validateAndReturn(streams, candidate.provider, 'anivexa', episode, audio, attempts); } catch {}
+      try { return await validateAndReturn(streams, candidate.provider, 'anivexa', episode, audio, attempts, ctx.signal); } catch (error) { attempts.push({ engine: 'anivexa', provider: candidate.provider, error: safeError(error) }); }
     } catch (error) {
-      attempts.push({ engine: 'anivexa', provider: candidate.provider, error: error.message });
+      attempts.push({ engine: 'anivexa', provider: candidate.provider, error: safeError(error) });
     }
   }
   throw new Error('No validated Anivexa provider stream');
 }
 
-async function trySdk(anilistId, episode, audio, attempts) {
+async function trySdk(anilistId, episode, audio, attempts, ctx) {
   let titleData;
-  try {
-    titleData = await fetchJson(`http://127.0.0.1:${KUHI_PORT}/info/${encodeURIComponent(anilistId)}`);
-  } catch {
-    titleData = null;
-  }
+  try { titleData = await fetchJson(`http://127.0.0.1:${KUHI_PORT}/info/${encodeURIComponent(anilistId)}`, { timeoutMs: DISCOVERY_TIMEOUT_MS, stage: 'SDK title discovery', signal: ctx.signal }); } catch { titleData = null; }
   const title = titleData?.title?.userPreferred || titleData?.title?.english || titleData?.title?.romaji;
   if (!title) throw new Error('Unable to resolve anime title for SDK fallback');
-
-  const sdkProviders = [
-    'gogoanime', 'goyabu', 'allmanga', 'animeparadise', 'anikoto', 'megaplay', 'mangadex', 'weebcentral', 'mangapill'
-  ];
+  const sdkProviders = ['gogoanime', 'goyabu', 'allmanga', 'animeparadise', 'anikoto', 'megaplay', 'mangadex', 'weebcentral', 'mangapill'];
   for (const provider of sdkProviders) {
     try {
-      const results = await fetchJson(`http://127.0.0.1:${SDK_PORT}/search?provider=${encodeURIComponent(provider)}&q=${encodeURIComponent(title)}`);
+      const results = await fetchJson(`http://127.0.0.1:${SDK_PORT}/search?provider=${encodeURIComponent(provider)}&q=${encodeURIComponent(title)}`, { timeoutMs: DISCOVERY_TIMEOUT_MS, stage: 'SDK provider discovery', signal: ctx.signal });
       const match = Array.isArray(results) ? results[0] : null;
       if (!match?.id) { attempts.push({ engine: 'anime-sdk', provider, error: 'no title match' }); continue; }
-      const units = await fetchJson(`http://127.0.0.1:${SDK_PORT}/content?provider=${encodeURIComponent(provider)}&mediaId=${encodeURIComponent(match.id)}`);
+      const units = await fetchJson(`http://127.0.0.1:${SDK_PORT}/content?provider=${encodeURIComponent(provider)}&mediaId=${encodeURIComponent(match.id)}`, { timeoutMs: DISCOVERY_TIMEOUT_MS, stage: 'SDK episode discovery', signal: ctx.signal });
       const unit = Array.isArray(units) ? units.find((u) => Number(u.number) === Number(episode)) : null;
       if (!unit?.id) { attempts.push({ engine: 'anime-sdk', provider, error: 'episode not found' }); continue; }
-      const stream = await fetchJson(`http://127.0.0.1:${SDK_PORT}/stream?provider=${encodeURIComponent(provider)}&unitId=${encodeURIComponent(unit.id)}&language=${encodeURIComponent(audio)}`);
+      const stream = await fetchJson(`http://127.0.0.1:${SDK_PORT}/stream?provider=${encodeURIComponent(provider)}&unitId=${encodeURIComponent(unit.id)}&language=${encodeURIComponent(audio)}`, { timeoutMs: EXTRACTION_TIMEOUT_MS, stage: 'SDK extraction', signal: ctx.signal });
       const streams = normalizeStreams(stream, provider, 'anime-sdk', episode, audio);
       attempts.push({ engine: 'anime-sdk', provider, streams: streams.length });
-      try { return await validateAndReturn(streams, provider, 'anime-sdk', episode, audio, attempts); } catch {}
+      try { return await validateAndReturn(streams, provider, 'anime-sdk', episode, audio, attempts, ctx.signal); } catch (error) { attempts.push({ engine: 'anime-sdk', provider, error: safeError(error) }); }
     } catch (error) {
-      attempts.push({ engine: 'anime-sdk', provider, error: error.message });
+      attempts.push({ engine: 'anime-sdk', provider, error: safeError(error) });
     }
   }
   throw new Error('No validated anime-sdk provider stream');
@@ -330,26 +377,24 @@ async function unifiedWatch(req, res, url) {
   if (!/^\d+$/.test(String(anilistId || ''))) return json(res, 400, { error: 'anilistId must be numeric' });
   if (!/^\d+(?:\.\d+)?$/.test(String(episode))) return json(res, 400, { error: 'episode must be numeric' });
   if (!['sub', 'dub', 'raw'].includes(audio)) return json(res, 400, { error: 'type must be sub, dub, or raw' });
-
   const attempts = [];
+  const deadline = new AbortController();
+  const timer = setTimeout(() => deadline.abort(new TimeoutError('total request')), TOTAL_REQUEST_DEADLINE_MS);
+  const ctx = { signal: deadline.signal };
   const engines = [
-    () => tryKuhi(anilistId, episode, audio, attempts),
-    () => tryAnivexa(anilistId, episode, audio, attempts),
-    () => trySdk(anilistId, episode, audio, attempts),
+    () => tryKuhi(anilistId, episode, audio, attempts, ctx),
+    () => tryAnivexa(anilistId, episode, audio, attempts, ctx),
+    () => trySdk(anilistId, episode, audio, attempts, ctx),
   ];
-  for (const attempt of engines) {
-    try { return json(res, 200, await attempt()); } catch (error) {
-      attempts.push({ error: error.message });
+  try {
+    for (const attempt of engines) {
+      if (deadline.signal.aborted) break;
+      try { return json(res, 200, await attempt()); } catch (error) { attempts.push({ error: safeError(error) }); }
     }
+    return json(res, 502, { ok: false, error: 'No working stream found', anilistId: Number(anilistId), episode: Number(episode), audio, attempts });
+  } finally {
+    clearTimeout(timer);
   }
-  return json(res, 502, {
-    ok: false,
-    error: 'No provider returned a validated stream',
-    anilistId: Number(anilistId),
-    episode: Number(episode),
-    audio,
-    attempts,
-  });
 }
 
 async function proxy(req, res, targetBase, prefix) {
@@ -376,7 +421,7 @@ async function proxy(req, res, targetBase, prefix) {
     for await (const chunk of upstream.body) res.write(chunk);
     res.end();
   } catch (error) {
-    json(res, 502, { error: 'upstream unavailable', detail: error?.message || String(error) });
+    json(res, 502, { error: 'upstream unavailable', detail: safeError(error) });
   }
 }
 
