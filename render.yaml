@@ -27,7 +27,7 @@ services:
       - key: DISCOVERY_TIMEOUT_MS
         value: "10000"
       - key: EXTRACTION_TIMEOUT_MS
-        value: "25000"
+        value: "15000"
       - key: STREAM_VALIDATION_TIMEOUT_MS
         value: "7000"
       - key: HLS_VALIDATION_TIMEOUT_MS
@@ -36,6 +36,10 @@ services:
         value: "60000"
       - key: MAX_VALIDATION_CANDIDATES
         value: "6"
+      - key: RETRY_COUNT
+        value: "1"
+      - key: RETRY_BACKOFF_MS
+        value: "250"
       - key: METADATA_TIMEOUT_MS
         value: "10000"
       - key: METADATA_EPISODES_TIMEOUT_MS

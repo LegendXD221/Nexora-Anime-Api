@@ -22,7 +22,9 @@ const SDK_PORT = Number(process.env.SDK_PORT || 3001);
 const KUHI_PORT = Number(process.env.KUHI_PORT || 8001);
 const STARTUP_TIMEOUT_MS = Number(process.env.STARTUP_TIMEOUT_MS || 30000);
 const DISCOVERY_TIMEOUT_MS = Number(process.env.DISCOVERY_TIMEOUT_MS || 10000);
-const EXTRACTION_TIMEOUT_MS = Number(process.env.EXTRACTION_TIMEOUT_MS || 25000);
+const EXTRACTION_TIMEOUT_MS = Number(process.env.EXTRACTION_TIMEOUT_MS || 15000);
+const RETRY_COUNT = Number(process.env.RETRY_COUNT || 1);
+const RETRY_BACKOFF_MS = Number(process.env.RETRY_BACKOFF_MS || 250);
 const STREAM_VALIDATION_TIMEOUT_MS = Number(process.env.STREAM_VALIDATION_TIMEOUT_MS || 7000);
 const HLS_VALIDATION_TIMEOUT_MS = Number(process.env.HLS_VALIDATION_TIMEOUT_MS || 5000);
 const TOTAL_REQUEST_DEADLINE_MS = Number(process.env.TOTAL_REQUEST_DEADLINE_MS || 60000);
@@ -36,6 +38,7 @@ const TRUST_PROXY = process.env.TRUST_PROXY === 'true';
 
 const rateBuckets = new Map();
 const metadataCache = memoryCache();
+const metadataFallbackCache = new Map();
 const services = {
   gateway: { ok: true, ready: true },
   anivexa: { ok: false, ready: false },
@@ -230,24 +233,38 @@ function stageTimeout(stage, timeoutMs, parentSignal) {
   };
 }
 
+function retryable(error) {
+  const message = safeError(error);
+  return /timeout|HTTP (429|502|503|504)/i.test(message);
+}
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 async function fetchJson(url, { timeoutMs = EXTRACTION_TIMEOUT_MS, stage = 'provider', signal, headers, ...options } = {}) {
-  const timed = stageTimeout(stage, timeoutMs, signal);
-  try {
-    const response = await fetch(url, { ...options, headers, signal: timed.signal });
-    const text = await response.text();
-    let data;
-    try { data = text ? JSON.parse(text) : null; } catch { data = null; }
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return data;
-  } catch (error) {
-    if (timed.signal.aborted) {
-      if (timed.signal.reason instanceof TimeoutError) throw timed.signal.reason;
-      throw new Error('request aborted');
+  let lastError;
+  for (let attempt = 0; attempt <= RETRY_COUNT; attempt += 1) {
+    const timed = stageTimeout(stage, timeoutMs, signal);
+    try {
+      const response = await fetch(url, { ...options, headers, signal: timed.signal });
+      const text = await response.text();
+      let data;
+      try { data = text ? JSON.parse(text) : null; } catch { data = null; }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return data;
+    } catch (error) {
+      if (timed.signal.aborted) {
+        lastError = timed.signal.reason instanceof TimeoutError ? timed.signal.reason : new Error('request aborted');
+      } else {
+        lastError = error;
+      }
+      if (attempt >= RETRY_COUNT || !retryable(lastError) || signal?.aborted) break;
+      console.warn(`[RETRY] ${stage} attempt ${attempt + 1}/${RETRY_COUNT}`);
+      await sleep(RETRY_BACKOFF_MS * (attempt + 1));
+    } finally {
+      timed.cleanup();
     }
-    throw error;
-  } finally {
-    timed.cleanup();
   }
+  throw lastError;
 }
 
 function streamKey(stream) {
@@ -297,6 +314,7 @@ async function validateStream(stream, signal) {
     });
     if (!response.ok) return false;
     const contentType = (response.headers.get('content-type') || '').toLowerCase();
+    if (contentType.includes('text/html')) return false;
     if (isHls) return (await response.text()).includes('#EXTM3U');
     return contentType.startsWith('video/') || contentType.includes('mpegurl') || contentType.includes('octet-stream') || /\.(mp4|mkv)(?:$|\?)/i.test(stream.url);
   } catch {
@@ -313,8 +331,10 @@ async function validateAndReturn(streams, provider, engine, episode, audio, atte
   for (const stream of candidates) {
     if (signal?.aborted) throw signal.reason || new Error('request deadline exceeded');
     if (await validateStream(stream, signal)) {
+      console.log(`[VALIDATION] accepted ${stream.type || 'stream'} provider=${provider}`);
       return { ok: true, provider, engine, episode: Number(episode), audio, stream, streams: ordered, attempts };
     }
+    console.warn(`[VALIDATION] rejected stream provider=${provider}`);
   }
   throw new Error('Returned streams failed validation');
 }
@@ -386,14 +406,22 @@ async function unifiedWatch(req, res, url) {
   const timer = setTimeout(() => deadline.abort(new TimeoutError('total request')), TOTAL_REQUEST_DEADLINE_MS);
   const ctx = { signal: deadline.signal };
   const engines = [
-    () => tryKuhi(anilistId, episode, audio, attempts, ctx),
-    () => tryAnivexa(anilistId, episode, audio, attempts, ctx),
-    () => trySdk(anilistId, episode, audio, attempts, ctx),
+    { name: 'Kuhi', run: () => tryKuhi(anilistId, episode, audio, attempts, ctx) },
+    { name: 'Anivexa', run: () => tryAnivexa(anilistId, episode, audio, attempts, ctx) },
+    { name: 'anime-sdk', run: () => trySdk(anilistId, episode, audio, attempts, ctx) },
   ];
   try {
-    for (const attempt of engines) {
+    for (const engine of engines) {
       if (deadline.signal.aborted) break;
-      try { return json(res, 200, await attempt()); } catch (error) { attempts.push({ error: safeError(error) }); }
+      try {
+        const result = await engine.run();
+        console.log(`[STREAM] Valid stream provider=${result.provider} engine=${result.engine}`);
+        return json(res, 200, result);
+      } catch (error) {
+        const reason = safeError(error);
+        attempts.push({ engine: engine.name.toLowerCase(), error: reason });
+        console.warn(`[FALLBACK] ${engine.name} ${reason}; trying next provider`);
+      }
     }
     return json(res, 502, { ok: false, error: 'No working stream found', anilistId: Number(anilistId), episode: Number(episode), audio, attempts });
   } finally {
@@ -415,12 +443,22 @@ function forwardQuery(url, names, aliases = {}) {
 async function metadataFetch(path, cacheKey, timeoutMs = METADATA_TIMEOUT_MS) {
   const hit = await metadataCache.get(cacheKey);
   if (hit !== undefined) return hit;
-  const data = await fetchJson(`http://127.0.0.1:${KUHI_PORT}${path}`, {
-    timeoutMs,
-    stage: 'metadata',
-  });
-  await metadataCache.set(cacheKey, data, METADATA_CACHE_TTL_MS);
-  return data;
+  try {
+    const data = await fetchJson(`http://127.0.0.1:${KUHI_PORT}${path}`, {
+      timeoutMs,
+      stage: 'metadata',
+    });
+    await metadataCache.set(cacheKey, data, METADATA_CACHE_TTL_MS);
+    metadataFallbackCache.set(cacheKey, { value: data, expiresAt: Date.now() + METADATA_CACHE_TTL_MS * 4 });
+    return data;
+  } catch (error) {
+    const stale = metadataFallbackCache.get(cacheKey);
+    if (stale && stale.expiresAt > Date.now()) {
+      console.warn(`[METADATA] serving cached data after ${safeError(error)}`);
+      return stale.value;
+    }
+    throw error;
+  }
 }
 
 function metadataResult(data) {
