@@ -273,6 +273,8 @@ function streamKey(stream) {
 
 function normalizeStreams(payload, provider, engine, episode, audio) {
   if (!payload || !Array.isArray(payload.streams)) return [];
+  const inheritedHeaders = payload.headers && typeof payload.headers === 'object' ? payload.headers : undefined;
+  const inheritedSubtitles = Array.isArray(payload.subtitles) ? payload.subtitles : [];
   const seen = new Set();
   const result = [];
   for (const s of payload.streams) {
@@ -283,8 +285,8 @@ function normalizeStreams(payload, provider, engine, episode, audio) {
       type: s.type || (s.isHLS || /\.m3u8(?:$|\?)/i.test(url) ? 'hls' : 'mp4'),
       quality: s.quality || 'auto',
       language: s.audio || s.language || audio,
-      headers: s.headers || (s.referer ? { Referer: s.referer } : undefined),
-      subtitles: Array.isArray(s.subtitles) ? s.subtitles : [],
+      headers: s.headers || (s.referer ? { Referer: s.referer } : inheritedHeaders),
+      subtitles: Array.isArray(s.subtitles) && s.subtitles.length ? s.subtitles : inheritedSubtitles,
       server: s.server || provider,
     };
     const key = streamKey(stream);
