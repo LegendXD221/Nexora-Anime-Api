@@ -27,11 +27,14 @@ const STREAM_VALIDATION_TIMEOUT_MS = Number(process.env.STREAM_VALIDATION_TIMEOU
 const HLS_VALIDATION_TIMEOUT_MS = Number(process.env.HLS_VALIDATION_TIMEOUT_MS || 5000);
 const TOTAL_REQUEST_DEADLINE_MS = Number(process.env.TOTAL_REQUEST_DEADLINE_MS || 60000);
 const MAX_VALIDATION_CANDIDATES = Number(process.env.MAX_VALIDATION_CANDIDATES || 6);
+const METADATA_TIMEOUT_MS = Number(process.env.METADATA_TIMEOUT_MS || 10000);
+const METADATA_CACHE_TTL_MS = Number(process.env.METADATA_CACHE_TTL_MS || 300000);
 const RATE_LIMIT = Number(process.env.RATE_LIMIT || 120);
 const RATE_WINDOW_MS = Number(process.env.RATE_WINDOW_MS || 60_000);
 const TRUST_PROXY = process.env.TRUST_PROXY === 'true';
 
 const rateBuckets = new Map();
+const metadataCache = memoryCache();
 const services = {
   gateway: { ok: true, ready: true },
   anivexa: { ok: false, ready: false },
@@ -397,6 +400,101 @@ async function unifiedWatch(req, res, url) {
   }
 }
 
+
+function forwardQuery(url, names, aliases = {}) {
+  const params = new URLSearchParams();
+  for (const name of names) {
+    const source = aliases[name] || name;
+    const value = url.searchParams.get(source);
+    if (value !== null && value !== '') params.set(name, value);
+  }
+  return params.toString();
+}
+
+async function metadataFetch(path, cacheKey) {
+  const hit = await metadataCache.get(cacheKey);
+  if (hit !== undefined) return hit;
+  const data = await fetchJson(`http://127.0.0.1:${KUHI_PORT}${path}`, {
+    timeoutMs: METADATA_TIMEOUT_MS,
+    stage: 'metadata',
+  });
+  await metadataCache.set(cacheKey, data, METADATA_CACHE_TTL_MS);
+  return data;
+}
+
+function metadataResult(data) {
+  if (data && typeof data === 'object' && !Array.isArray(data)) return { ok: true, ...data };
+  return { ok: true, data };
+}
+
+function metadataError(error, animeRoute = false) {
+  if (/HTTP 404/.test(safeError(error))) return { status: 404, body: { ok: false, error: animeRoute ? 'Anime not found' : 'Metadata not found' } };
+  return { status: 502, body: { ok: false, error: 'Metadata provider unavailable' } };
+}
+
+async function unifiedMetadata(res, url) {
+  const path = url.pathname;
+  try {
+    if (path === '/api/search') {
+      const query = url.searchParams.get('q') || url.searchParams.get('query');
+      if (!query) return json(res, 400, { ok: false, error: 'q is required' });
+      const qs = forwardQuery(url, ['page', 'per_page'], { page: 'page' });
+      const suffix = qs ? `?query=${encodeURIComponent(query)}&${qs}` : `?query=${encodeURIComponent(query)}`;
+      return json(res, 200, metadataResult(await metadataFetch(`/anime/search${suffix}`, `search:${query}:${qs}`)));
+    }
+
+    if (path === '/api/suggestions') {
+      const query = url.searchParams.get('q') || url.searchParams.get('query');
+      if (!query) return json(res, 400, { ok: false, error: 'q is required' });
+      const data = await metadataFetch(`/anime/suggestions?query=${encodeURIComponent(query)}`, `suggestions:${query}`);
+      return json(res, 200, { ok: true, results: data?.suggestions || [] });
+    }
+
+    const animeMatch = path.match(/^\/api\/anime\/(\d+)(?:\/(characters|relations|recommendations|episodes))?$/);
+    if (animeMatch) {
+      const id = animeMatch[1];
+      const section = animeMatch[2];
+      if (!section) {
+        const data = await metadataFetch(`/anime/info/${id}`, `anime:${id}`);
+        return json(res, 200, { ok: true, data });
+      }
+      const endpoint = section === 'episodes' ? `/anime/episodes/${id}` : `/anime/anime/${id}/${section}`;
+      const data = await metadataFetch(endpoint, `${section}:${id}`);
+      if (section === 'episodes') {
+        const episodes = Array.isArray(data) ? data : data?.episodes || data?.results || [];
+        return json(res, 200, Array.isArray(data) ? { ok: true, episodes } : { ok: true, ...data, episodes });
+      }
+      return json(res, 200, metadataResult(data));
+    }
+
+    const simpleRoutes = {
+      '/api/genres': { target: '/anime/genres', key: 'genres', shape: data => ({ ok: true, results: data?.genres || [] }) },
+      '/api/spotlight': { target: '/anime/spotlight', key: 'spotlight' },
+      '/api/trending': { target: '/anime/trending', key: 'trending' },
+      '/api/popular': { target: '/anime/popular', key: 'popular' },
+      '/api/upcoming': { target: '/anime/upcoming', key: 'upcoming' },
+      '/api/recent': { target: '/anime/recent', key: 'recent' },
+      '/api/schedule': { target: '/anime/schedule', key: 'schedule' },
+      '/api/filter': { target: '/anime/filter', key: 'filter' },
+    };
+    const route = simpleRoutes[path];
+    if (route) {
+      const names = path === '/api/filter'
+        ? ['genre', 'tag', 'year', 'season', 'format', 'status', 'sort', 'page', 'per_page']
+        : ['page', 'per_page'];
+      const qs = forwardQuery(url, names);
+      const target = qs ? `${route.target}?${qs}` : route.target;
+      const data = await metadataFetch(target, `${route.key}:${qs}`);
+      return json(res, 200, route.shape ? route.shape(data) : metadataResult(data));
+    }
+
+    return json(res, 404, { ok: false, error: 'route not found' });
+  } catch (error) {
+    const failure = metadataError(error, /^\/api\/anime\//.test(path));
+    return json(res, failure.status, failure.body);
+  }
+}
+
 async function proxy(req, res, targetBase, prefix) {
   const suffix = req.url.startsWith(prefix) ? req.url.slice(prefix.length) || '/' : req.url;
   const target = new URL(suffix, targetBase);
@@ -467,6 +565,7 @@ const publicServer = http.createServer(async (req, res) => {
   }
 
   if (p === '/api/watch' || p === '/api/stream') return unifiedWatch(req, res, new URL(req.url, `http://${req.headers.host || 'localhost'}`));
+  if (p.startsWith('/api/')) return unifiedMetadata(res, new URL(req.url, `http://${req.headers.host || 'localhost'}`));
 
   if (p === '/') {
     return json(res, 200, {

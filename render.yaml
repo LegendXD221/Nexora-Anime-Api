@@ -36,3 +36,7 @@ services:
         value: "60000"
       - key: MAX_VALIDATION_CANDIDATES
         value: "6"
+      - key: METADATA_TIMEOUT_MS
+        value: "10000"
+      - key: METADATA_CACHE_TTL_MS
+        value: "300000"
