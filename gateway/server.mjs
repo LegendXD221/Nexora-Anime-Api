@@ -348,32 +348,57 @@ async function tryKuhi(anilistId, episode, audio, attempts, ctx) {
 }
 
 async function tryAnivexa(anilistId, episode, audio, attempts, ctx) {
-  const data = await fetchJson(`http://127.0.0.1:${ANIVEXA_PORT}/episodes/${encodeURIComponent(anilistId)}`, { timeoutMs: DISCOVERY_TIMEOUT_MS, stage: 'Anivexa discovery', signal: ctx.signal });
-  const candidates = [];
-  for (const [provider, entry] of Object.entries(data || {})) {
-    const lists = entry?.episodes?.[audio] || [];
-    const match = lists.find((ep) => Number(ep?.number) === Number(episode));
-    if (match?.id) candidates.push({ provider, id: match.id });
-  }
-  for (const candidate of candidates) {
+  // The AniList ID is already known. Race only direct, installed Anivexa routes
+  // instead of first calling the expensive aggregate /episodes/:id route.
+  const providers = ['anikoto', 'reanime', 'animegg', 'anineko', 'anizone', 'aniwaves', 'anidbapp', 'animenosub', 'anibd', 'senshi', 'kaa', 'animedunya', 'animeonsen'];
+  const racers = providers.map(provider => (async () => {
+    const started = Date.now();
+    const local = new AbortController();
+    const abortParent = () => local.abort(ctx.signal.reason || new Error('request aborted'));
+    if (ctx.signal.aborted) abortParent();
+    else ctx.signal.addEventListener('abort', abortParent, { once: true });
+    const route = `/watch/${provider}/${encodeURIComponent(anilistId)}/${encodeURIComponent(audio)}/${provider}-${encodeURIComponent(episode)}`;
+    console.log(`[ANIVEXA] provider started provider=${provider}`);
     try {
-      const path = candidate.id.startsWith('/') ? candidate.id : `/${candidate.id}`;
-      const result = await fetchJson(`http://127.0.0.1:${ANIVEXA_PORT}${path}`, { timeoutMs: EXTRACTION_TIMEOUT_MS, stage: 'Anivexa extraction', signal: ctx.signal });
-      const streams = normalizeStreams(result, candidate.provider, 'anivexa', episode, audio);
-      attempts.push({ engine: 'anivexa', provider: candidate.provider, streams: streams.length });
-      try { return await validateAndReturn(streams, candidate.provider, 'anivexa', episode, audio, attempts, ctx.signal); } catch (error) { attempts.push({ engine: 'anivexa', provider: candidate.provider, error: safeError(error) }); }
+      const data = await fetchJson(`http://127.0.0.1:${ANIVEXA_PORT}${route}`, {
+        timeoutMs: Math.min(8000, Math.max(1000, TOTAL_REQUEST_DEADLINE_MS - 1000)),
+        stage: `Anivexa ${provider}`,
+        signal: local.signal,
+      });
+      const streams = normalizeStreams(data, provider, 'anivexa', episode, audio);
+      attempts.push({ engine: 'anivexa', provider, streams: streams.length });
+      const result = await validateAndReturn(streams, provider, 'anivexa', episode, audio, attempts, local.signal);
+      console.log(`[ANIVEXA] provider completed provider=${provider} duration_ms=${Date.now() - started}`);
+      return result;
     } catch (error) {
-      attempts.push({ engine: 'anivexa', provider: candidate.provider, error: safeError(error) });
+      const reason = safeError(error);
+      attempts.push({ engine: 'anivexa', provider, error: reason });
+      console.warn(`[ANIVEXA] provider failed provider=${provider} duration_ms=${Date.now() - started} error=${reason}`);
+      throw error;
+    } finally {
+      ctx.signal.removeEventListener('abort', abortParent);
     }
+  })());
+
+  try {
+    const result = await Promise.any(racers);
+    return result;
+  } catch {
+    throw new Error('No validated direct Anivexa provider stream');
   }
-  throw new Error('No validated Anivexa provider stream');
 }
 
 async function trySdk(anilistId, episode, audio, attempts, ctx) {
   let titleData;
-  try { titleData = await fetchJson(`http://127.0.0.1:${KUHI_PORT}/info/${encodeURIComponent(anilistId)}`, { timeoutMs: DISCOVERY_TIMEOUT_MS, stage: 'SDK title discovery', signal: ctx.signal }); } catch { titleData = null; }
+  let titleError = null;
+  console.log(`[SDK] title resolution started anilistId=${anilistId}`);
+  try { titleData = await fetchJson(`http://127.0.0.1:${KUHI_PORT}/info/${encodeURIComponent(anilistId)}`, { timeoutMs: DISCOVERY_TIMEOUT_MS, stage: 'SDK title discovery', signal: ctx.signal }); } catch (error) { titleError = safeError(error); titleData = null; }
   const title = titleData?.title?.userPreferred || titleData?.title?.english || titleData?.title?.romaji;
-  if (!title) throw new Error('Unable to resolve anime title for SDK fallback');
+  if (!title) {
+    console.warn(`[SDK] title resolution failed anilistId=${anilistId} error=${titleError || 'missing title'}`);
+    throw new Error('SDK title resolution unavailable');
+  }
+  console.log(`[SDK] title resolution completed anilistId=${anilistId}`);
   const sdkProviders = ['gogoanime', 'goyabu', 'allmanga', 'animeparadise', 'anikoto', 'megaplay', 'mangadex', 'weebcentral', 'mangapill'];
   for (const provider of sdkProviders) {
     try {
@@ -402,6 +427,8 @@ async function unifiedWatch(req, res, url) {
   if (!/^\d+(?:\.\d+)?$/.test(String(episode))) return json(res, 400, { error: 'episode must be numeric' });
   if (!['sub', 'dub', 'raw'].includes(audio)) return json(res, 400, { error: 'type must be sub, dub, or raw' });
   const attempts = [];
+  const watchStarted = Date.now();
+  console.log(`[WATCH] request started anilistId=${anilistId} episode=${episode} audio=${audio}`);
   const deadline = new AbortController();
   const timer = setTimeout(() => deadline.abort(new TimeoutError('total request')), TOTAL_REQUEST_DEADLINE_MS);
   const ctx = { signal: deadline.signal };
@@ -414,15 +441,20 @@ async function unifiedWatch(req, res, url) {
     for (const engine of engines) {
       if (deadline.signal.aborted) break;
       try {
+        console.log(`[${engine.name.toUpperCase()}] started`);
         const result = await engine.run();
+        console.log(`[${engine.name.toUpperCase()}] completed duration_ms=${Date.now() - watchStarted}`);
         console.log(`[STREAM] Valid stream provider=${result.provider} engine=${result.engine}`);
+        console.log(`[WATCH] completed status=200 duration_ms=${Date.now() - watchStarted}`);
         return json(res, 200, result);
       } catch (error) {
         const reason = safeError(error);
         attempts.push({ engine: engine.name.toLowerCase(), error: reason });
+        console.warn(`[${engine.name.toUpperCase()}] failed duration_ms=${Date.now() - watchStarted} error=${reason}`);
         console.warn(`[FALLBACK] ${engine.name} ${reason}; trying next provider`);
       }
     }
+    console.warn(`[WATCH] completed status=502 duration_ms=${Date.now() - watchStarted}`);
     return json(res, 502, { ok: false, error: 'No working stream found', anilistId: Number(anilistId), episode: Number(episode), audio, attempts });
   } finally {
     clearTimeout(timer);
