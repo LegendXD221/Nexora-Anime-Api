@@ -38,5 +38,7 @@ services:
         value: "6"
       - key: METADATA_TIMEOUT_MS
         value: "10000"
+      - key: METADATA_EPISODES_TIMEOUT_MS
+        value: "30000"
       - key: METADATA_CACHE_TTL_MS
         value: "300000"

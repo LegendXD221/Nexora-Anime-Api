@@ -28,6 +28,7 @@ const HLS_VALIDATION_TIMEOUT_MS = Number(process.env.HLS_VALIDATION_TIMEOUT_MS |
 const TOTAL_REQUEST_DEADLINE_MS = Number(process.env.TOTAL_REQUEST_DEADLINE_MS || 60000);
 const MAX_VALIDATION_CANDIDATES = Number(process.env.MAX_VALIDATION_CANDIDATES || 6);
 const METADATA_TIMEOUT_MS = Number(process.env.METADATA_TIMEOUT_MS || 10000);
+const METADATA_EPISODES_TIMEOUT_MS = Number(process.env.METADATA_EPISODES_TIMEOUT_MS || 30000);
 const METADATA_CACHE_TTL_MS = Number(process.env.METADATA_CACHE_TTL_MS || 300000);
 const RATE_LIMIT = Number(process.env.RATE_LIMIT || 120);
 const RATE_WINDOW_MS = Number(process.env.RATE_WINDOW_MS || 60_000);
@@ -411,11 +412,11 @@ function forwardQuery(url, names, aliases = {}) {
   return params.toString();
 }
 
-async function metadataFetch(path, cacheKey) {
+async function metadataFetch(path, cacheKey, timeoutMs = METADATA_TIMEOUT_MS) {
   const hit = await metadataCache.get(cacheKey);
   if (hit !== undefined) return hit;
   const data = await fetchJson(`http://127.0.0.1:${KUHI_PORT}${path}`, {
-    timeoutMs: METADATA_TIMEOUT_MS,
+    timeoutMs,
     stage: 'metadata',
   });
   await metadataCache.set(cacheKey, data, METADATA_CACHE_TTL_MS);
@@ -425,6 +426,31 @@ async function metadataFetch(path, cacheKey) {
 function metadataResult(data) {
   if (data && typeof data === 'object' && !Array.isArray(data)) return { ok: true, ...data };
   return { ok: true, data };
+}
+
+function compactEpisodes(data) {
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.episodes)) return data.episodes;
+  if (Array.isArray(data?.results)) return data.results;
+  const byNumber = new Map();
+  for (const provider of Object.values(data?.providers || {})) {
+    const groups = provider?.episodes || {};
+    for (const category of ['sub', 'dub', 'raw']) {
+      for (const episode of Array.isArray(groups[category]) ? groups[category] : []) {
+        const number = Number(episode?.number);
+        if (!Number.isFinite(number) || byNumber.has(number)) continue;
+        byNumber.set(number, {
+          number,
+          title: episode.title ?? null,
+          description: episode.description ?? null,
+          image: episode.image ?? episode.thumbnail ?? null,
+          airingAt: episode.airDate ?? episode.airingAt ?? null,
+          duration: episode.duration ?? null,
+        });
+      }
+    }
+  }
+  return [...byNumber.values()].sort((a, b) => a.number - b.number);
 }
 
 function metadataError(error, animeRoute = false) {
@@ -459,10 +485,9 @@ async function unifiedMetadata(res, url) {
         return json(res, 200, { ok: true, data });
       }
       const endpoint = section === 'episodes' ? `/anime/episodes/${id}` : `/anime/anime/${id}/${section}`;
-      const data = await metadataFetch(endpoint, `${section}:${id}`);
+      const data = await metadataFetch(endpoint, `${section}:${id}`, section === 'episodes' ? METADATA_EPISODES_TIMEOUT_MS : METADATA_TIMEOUT_MS);
       if (section === 'episodes') {
-        const episodes = Array.isArray(data) ? data : data?.episodes || data?.results || [];
-        return json(res, 200, Array.isArray(data) ? { ok: true, episodes } : { ok: true, ...data, episodes });
+        return json(res, 200, { ok: true, episodes: compactEpisodes(data) });
       }
       return json(res, 200, metadataResult(data));
     }
